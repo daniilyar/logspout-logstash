@@ -6,14 +6,17 @@ import (
 	_ "expvar"
 	"log"
 	"net"
+    "strings"
 	"regexp"
 	"strconv"
 	"time"
+    "os"
 
+    "github.com/fsouza/go-dockerclient"
 	"github.com/gliderlabs/logspout/router"
 	"github.com/rcrowley/go-metrics"
 	"github.com/rcrowley/go-metrics/exp"
-	"github.com/udacity/logspout-logstash/multiline"
+	"github.com/daniilyar/logspout-logstash/multiline"
 )
 
 var (
@@ -30,12 +33,13 @@ type newMultilineBufferFn func() (multiline.MultiLine, error)
 
 // LogstashAdapter is an adapter that streams TCP JSON to Logstash.
 type LogstashAdapter struct {
-	write       writer
-	route       *router.Route
-	cache       map[string]*multiline.MultiLine
-	cacheTTL    time.Duration
+	write	   writer
+	route	   *router.Route
+	cache	   map[string]*multiline.MultiLine
+	cacheTTL	time.Duration
 	cachedLines metrics.Gauge
-	mkBuffer    newMultilineBufferFn
+	mkBuffer	newMultilineBufferFn
+    containerTags map[string][]string
 }
 
 type ControlCode int
@@ -46,9 +50,12 @@ const (
 )
 
 func newLogstashAdapter(route *router.Route, write writer) *LogstashAdapter {
+    
+    log.Println("Creating Logstash adapter ...")
+
 	patternString, ok := route.Options["pattern"]
 	if !ok {
-		patternString = `(^\s)|(^Caused by:)`
+		patternString = `^\[`
 	}
 
 	groupWith, ok := route.Options["group_with"]
@@ -56,10 +63,10 @@ func newLogstashAdapter(route *router.Route, write writer) *LogstashAdapter {
 		groupWith = "previous"
 	}
 
-	negate := false
+	negate := true
 	negateStr, _ := route.Options["negate"]
-	if negateStr == "true" {
-		negate = true
+	if negateStr == "false" {
+		negate = false
 	}
 
 	separator, ok := route.Options["separator"]
@@ -80,31 +87,37 @@ func newLogstashAdapter(route *router.Route, write writer) *LogstashAdapter {
 	cachedLines := metrics.NewGauge()
 	metrics.Register(route.ID+"_cached_lines", cachedLines)
 
+    log.Println("Created Logstash adapter with following settings:")
+    log.Println("Logstash-adapter: multiline options: [ pattern=" + string(patternString) + ", groupWith=" + string(groupWith) + ", negate=" + negateStr + ", separator=" + string(separator), ", maxLines=" + string(maxLines) + ", cacheTTL=" + string(cacheTTL) + " ]")
+
 	return &LogstashAdapter{
-		route:       route,
-		write:       write,
-		cache:       make(map[string]*multiline.MultiLine),
-		cacheTTL:    cacheTTL,
+		route:	     route,
+		write:	     write,
+		cache:	     make(map[string]*multiline.MultiLine),
+		cacheTTL:	 cacheTTL,
 		cachedLines: cachedLines,
 		mkBuffer: func() (multiline.MultiLine, error) {
 			return multiline.NewMultiLine(
 				&multiline.MultilineConfig{
 					Pattern:   regexp.MustCompile(patternString),
 					GroupWith: groupWith,
-					Negate:    negate,
+					Negate:	negate,
 					Separator: &separator,
 					MaxLines:  maxLines,
 				})
 		},
+        containerTags: make(map[string][]string),
 	}
 }
 
-// NewLogstashAdapter creates a LogstashAdapter with TCP as the default transport.
+// NewLogstashAdapter creates a LogstashAdapter with UDP as the default transport.
 func NewLogstashAdapter(route *router.Route) (router.LogAdapter, error) {
 	transportId, ok := route.Options["transport"]
 	if !ok {
 		transportId = "udp"
 	}
+
+    log.Println("Logstash-adapter: using " + string(transportId) + " transport")
 
 	transport, found := router.AdapterTransports.Lookup(route.AdapterTransport(transportId))
 	if !found {
@@ -211,19 +224,28 @@ func (a *LogstashAdapter) flushPendingMessages() []*router.Message {
 func (a *LogstashAdapter) sendMessages(msgs []*router.Message) {
 	for _, msg := range msgs {
 		if err := a.sendMessage(msg); err != nil {
-			log.Fatal("logstash:", err)
+			log.Fatal("error when sending message to logstash:", err)
+            // DY: TODO: implement retries with backoff
+            os.Exit(3)
 		}
 	}
 	logMeter.Mark(int64(len(msgs)))
 }
 
 func (a *LogstashAdapter) sendMessage(msg *router.Message) error {
-	buff, err := serialize(msg)
+    
+    log.Println("Serializing message: ")
+	buff, err := serialize(msg, a)
+    log.Println("Serialized message")
 
 	if err != nil {
 		return err
 	}
+    
+    log.Println("Writing message to channel")
 	_, err = a.write(buff)
+    log.Println("Written message to channel")
+    
 	if err != nil {
 		return err
 	}
@@ -231,21 +253,25 @@ func (a *LogstashAdapter) sendMessage(msg *router.Message) error {
 	return nil
 }
 
-func serialize(msg *router.Message) ([]byte, error) {
+func serialize(msg *router.Message, a *LogstashAdapter) ([]byte, error) {
+
 	var js []byte
 	var jsonMsg map[string]interface{}
 
 	dockerInfo := DockerInfo{
-		Name:     msg.Container.Name,
-		ID:       msg.Container.ID,
-		Image:    msg.Container.Config.Image,
-		Hostname: msg.Container.Config.Hostname,
+		//Name:	     msg.Container.Name,
+		ID:		     msg.Container.ID[0:6], // take only first 6 symbols of container ID
+		// Image:	 msg.Container.Config.Image,
+		// Hostname: msg.Container.Config.Hostname,
 	}
-	udacityInfo := UdacityInfo{
-		Name:    msg.Container.Config.Labels["com.udacity.name"],
-		Version: msg.Container.Config.Labels["com.udacity.version"],
-		Env:     msg.Container.Config.Labels["com.udacity.env"],
+
+	kubernetesInfo := KubernetesInfo{
+		Pod:		 msg.Container.Config.Labels["io.kubernetes.pod.name"],
+		Container:	 msg.Container.Config.Labels["io.kubernetes.container.name"],
+		Namespace:	 msg.Container.Config.Labels["io.kubernetes.pod.namespace"],
 	}
+
+	tags := GetContainerTags(msg.Container, a)
 
 	err := json.Unmarshal([]byte(msg.Data), &jsonMsg)
 
@@ -253,9 +279,12 @@ func serialize(msg *router.Message) ([]byte, error) {
 		// the message is not in JSON make a new JSON message
 		msg := LogstashMessage{
 			Message: msg.Data,
+			Logtype: getEnvVar(msg.Container.Config.Env, "TYPE"),
+			// App: getEnvVar(msg.Container.Config.Env, "APP"),
 			Docker:  dockerInfo,
-			Udacity: udacityInfo,
+			Kubernetes: kubernetesInfo,
 			Stream:  msg.Source,
+			Tags:	tags,
 		}
 		js, err = json.Marshal(msg)
 		if err != nil {
@@ -264,7 +293,8 @@ func serialize(msg *router.Message) ([]byte, error) {
 	} else {
 		// the message is already in JSON just add the docker specific fields as a nested structure
 		jsonMsg["docker"] = dockerInfo
-		jsonMsg["udacity"] = udacityInfo
+		jsonMsg["tags"] = tags
+		jsonMsg["stream"] = msg.Source
 
 		js, err = json.Marshal(jsonMsg)
 		if err != nil {
@@ -276,24 +306,27 @@ func serialize(msg *router.Message) ([]byte, error) {
 }
 
 type DockerInfo struct {
-	Name     string `json:"name"`
-	ID       string `json:"id"`
-	Image    string `json:"image"`
-	Hostname string `json:"hostname"`
+	//Name	 string `json:"name"`
+	ID	   string `json:"id"`
+	//Image	string `json:"image"`
+	//Hostname string `json:"hostname"`
 }
 
-type UdacityInfo struct {
-	Name    string `json:"name"`
-	Env     string `json:"env"`
-	Version string `json:"version"`
+type KubernetesInfo struct {
+	Pod		   string `json:"pod"`
+	Container	 string `json:"container"`
+	Namespace	 string `json:"namespace"`
 }
 
 // LogstashMessage is a simple JSON input to Logstash.
 type LogstashMessage struct {
-	Message string      `json:"message"`
-	Stream  string      `json:"stream"`
-	Docker  DockerInfo  `json:"docker"`
-	Udacity UdacityInfo `json:"udacity"`
+	Message	string		 `json:"message"`
+	Stream	 string		 `json:"stream"`
+	Logtype	string		 `json:"log_type"`
+	// App	 string		 `json:"app"`
+	Docker	 DockerInfo	 `json:"docker"`
+	Kubernetes KubernetesInfo `json:"k8"`
+	Tags	   []string	   `json:"tags"`
 }
 
 // writers
@@ -307,7 +340,38 @@ func defaultWriter(conn net.Conn) writer {
 
 func tcpWriter(conn net.Conn) writer {
 	return func(b []byte) (int, error) {
-		// append a newline
+        
+        log.Println("Sending data via TCP ...")
+		
+        // append a newline
 		return conn.Write([]byte(string(b) + "\n"))
 	}
+}
+
+func getEnvVar(env []string, key string) string {
+  key_equals := key + "="
+  for _, value := range env {
+	if strings.HasPrefix(value, key_equals)  {
+	  return value[len(key_equals):]
+	}
+  }
+  return ""
+}
+
+// Get container tags configured with the environment variable LOGSTASH_TAGS
+func GetContainerTags(c *docker.Container, a *LogstashAdapter) []string {
+	if tags, ok := a.containerTags[c.ID]; ok {
+		return tags
+	}
+ 
+	var tags = []string{}
+	for _, e := range c.Config.Env {
+		if strings.HasPrefix(e, "LOGSTASH_TAGS=") {
+			tags = strings.Split(strings.TrimPrefix(e, "LOGSTASH_TAGS="), ",")
+			break
+		}
+	}
+ 
+	a.containerTags[c.ID] = tags
+	return tags
 }
