@@ -6,13 +6,13 @@ import (
 	_ "expvar"
 	"log"
 	"net"
-    "strings"
+	"strings"
 	"regexp"
 	"strconv"
 	"time"
-    "os"
+	"os"
 
-    "github.com/fsouza/go-dockerclient"
+        "github.com/fsouza/go-dockerclient"
 	"github.com/gliderlabs/logspout/router"
 	"github.com/rcrowley/go-metrics"
 	"github.com/rcrowley/go-metrics/exp"
@@ -87,8 +87,8 @@ func newLogstashAdapter(route *router.Route, write writer) *LogstashAdapter {
 	cachedLines := metrics.NewGauge()
 	metrics.Register(route.ID+"_cached_lines", cachedLines)
 
-    log.Println("Created Logstash adapter with following settings:")
-    log.Println("Logstash-adapter: multiline options: [ pattern=" + string(patternString) + ", groupWith=" + string(groupWith) + ", negate=" + negateStr + ", separator=" + string(separator), ", maxLines=" + string(maxLines) + ", cacheTTL=" + string(cacheTTL) + " ]")
+        log.Println("Created Logstash adapter with following settings:")
+	log.Println("Logstash-adapter: multiline options: [ pattern=" + string(patternString) + ", groupWith=" + string(groupWith) + ", negate=" + negateStr + ", separator=" + string(separator), ", maxLines=" + string(maxLines) + ", cacheTTL=" + string(cacheTTL) + " ]")
 
 	return &LogstashAdapter{
 		route:	     route,
@@ -173,27 +173,18 @@ func (a *LogstashAdapter) readMessages(
 		return a.expireCache(t), Continue
 	case msg, ok := <-logstream:
 		if ok {
+		    multilineAppsStr := os.Getenv("APPS_WITH_MULTILINE_LOGS")
+		    multilineApps := strings.Split(multilineAppsStr,",")
 
-            multilineAppsStr := os.Getenv("APPS_WITH_MULTILINE_LOGS")
+		    containerType := getEnvVar(msg.Container.Config.Env, "TYPE")
 
-            if len(multilineAppsStr) > 0 {
-                multilineApps := strings.Split(multilineAppsStr, ",")
-            } else {
-                multilineApps := []string{}
-            }
-
-            containerType := getEnvVar(msg.Container.Config.Env, "TYPE")
-            if containerType == nil {
-                containerType := ""
-            }
-
-            if stringIn(containerType, multilineApps) {
-                log.Println("Logstash-adapter: APP of type " + string(containerType) + " has multiline logs, buffering message ...")
-			    return a.bufferMessage(msg), Continue
-            } else {
-                log.Println("Logstash-adapter: APP of type " + string(containerType) + " has not multiline logs, not buffering message ...")
-                return []*router.Message{msg}, Continue
-            }
+		    if stringIn(containerType, multilineApps) {
+			log.Println("Logstash-adapter: APP of type " + string(containerType) + " has multiline logs, buffering message ...")
+				    return a.bufferMessage(msg), Continue
+		    } else {
+			log.Println("Logstash-adapter: APP of type " + string(containerType) + " has not multiline logs, not buffering message ...")
+			return []*router.Message{msg}, Continue
+		    }
 		} else {
 			return a.flushPendingMessages(), Quit
 		}
