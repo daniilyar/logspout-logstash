@@ -173,7 +173,13 @@ func (a *LogstashAdapter) readMessages(
 		return a.expireCache(t), Continue
 	case msg, ok := <-logstream:
 		if ok {
-			return a.bufferMessage(msg), Continue
+            if getEnvVar(msg.Container.Config.Env, "LOGSPOUT_MULTILINE_ENABLED") == true {
+                log.Println("Logstash-adapter: LOGSPOUT_MULTILINE_ENABLED is false, buffering message ")
+			    return a.bufferMessage(msg), Continue
+            } else {
+                log.Println("Logstash-adapter: LOGSPOUT_MULTILINE_ENABLED is true, not buffering message ")
+                return []*router.Message{msg}, Continue
+            }
 		} else {
 			return a.flushPendingMessages(), Quit
 		}
@@ -234,17 +240,13 @@ func (a *LogstashAdapter) sendMessages(msgs []*router.Message) {
 
 func (a *LogstashAdapter) sendMessage(msg *router.Message) error {
     
-    log.Println("Serializing message: ")
 	buff, err := serialize(msg, a)
-    log.Println("Serialized message")
 
 	if err != nil {
 		return err
 	}
-    
-    log.Println("Writing message to channel")
+
 	_, err = a.write(buff)
-    log.Println("Written message to channel")
     
 	if err != nil {
 		return err
