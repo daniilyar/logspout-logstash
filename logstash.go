@@ -173,7 +173,7 @@ func (a *LogstashAdapter) readMessages(
 		return a.expireCache(t), Continue
 	case msg, ok := <-logstream:
 		if ok {
-            if getEnvVar(msg.Container.Config.Env, "LOGSPOUT_MULTILINE_ENABLED") == true {
+            if getEnvVar(msg.Container.Config.Env, "LOGSPOUT_MULTILINE_ENABLED") == "true" {
                 log.Println("Logstash-adapter: LOGSPOUT_MULTILINE_ENABLED is false, buffering message ")
 			    return a.bufferMessage(msg), Continue
             } else {
