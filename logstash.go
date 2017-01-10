@@ -173,17 +173,40 @@ func (a *LogstashAdapter) readMessages(
 		return a.expireCache(t), Continue
 	case msg, ok := <-logstream:
 		if ok {
-            if getEnvVar(msg.Container.Config.Env, "LOGSPOUT_MULTILINE_ENABLED") == "true" {
-                log.Println("Logstash-adapter: LOGSPOUT_MULTILINE_ENABLED is false, buffering message ")
+
+            multilineAppsStr := os.Getenv("APPS_WITH_MULTILINE_LOGS")
+
+            if len(multilineAppsStr) > 0 {
+                multilineApps := strings.Split(multilineAppsStr, ",")
+            } else {
+                multilineApps := []string{}
+            }
+
+            containerType := getEnvVar(msg.Container.Config.Env, "TYPE")
+            if containerType == nil {
+                containerType := ""
+            }
+
+            if stringIn(containerType, multilineApps) {
+                log.Println("Logstash-adapter: APP of type " + string(containerType) + " has multiline logs, buffering message ...")
 			    return a.bufferMessage(msg), Continue
             } else {
-                log.Println("Logstash-adapter: LOGSPOUT_MULTILINE_ENABLED is true, not buffering message ")
+                log.Println("Logstash-adapter: APP of type " + string(containerType) + " has not multiline logs, not buffering message ...")
                 return []*router.Message{msg}, Continue
             }
 		} else {
 			return a.flushPendingMessages(), Quit
 		}
 	}
+}
+
+func stringIn(a string, list []string) bool {
+    for _, b := range list {
+        if b == a {
+            return true
+        }
+    }
+    return false
 }
 
 func (a *LogstashAdapter) bufferMessage(msg *router.Message) []*router.Message {
