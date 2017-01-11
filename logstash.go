@@ -177,6 +177,9 @@ func (a *LogstashAdapter) readMessages(
 		    multilineApps := strings.Split(multilineAppsStr,",")
 
 		    containerType := getEnvVar(msg.Container.Config.Env, "TYPE")
+		    if containerType == "" {
+			containerType = "<unknown>"
+		    }
 
 		    if stringIn(containerType, multilineApps) {
 			log.Println("Logstash-adapter: APP of type " + string(containerType) + " has multiline logs, buffering message ...")
