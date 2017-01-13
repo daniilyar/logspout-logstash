@@ -39,7 +39,8 @@ type LogstashAdapter struct {
 	cacheTTL	time.Duration
 	cachedLines metrics.Gauge
 	mkBuffer	newMultilineBufferFn
-    containerTags map[string][]string
+        containerTags map[string][]string
+	multilineApps []string
 }
 
 type ControlCode int
@@ -90,6 +91,8 @@ func newLogstashAdapter(route *router.Route, write writer) *LogstashAdapter {
         log.Println("Created Logstash adapter with following settings:")
 	log.Println("Logstash-adapter: multiline options: [ pattern=" + string(patternString) + ", groupWith=" + string(groupWith) + ", negate=" + negateStr + ", separator=" + string(separator), ", maxLines=" + string(maxLines) + ", cacheTTL=" + string(cacheTTL) + " ]")
 
+	multilineApps := strings.Split(os.Getenv("APPS_WITH_MULTILINE_LOGS"),",")
+
 	return &LogstashAdapter{
 		route:	     route,
 		write:	     write,
@@ -106,7 +109,8 @@ func newLogstashAdapter(route *router.Route, write writer) *LogstashAdapter {
 					MaxLines:  maxLines,
 				})
 		},
-        containerTags: make(map[string][]string),
+                containerTags: make(map[string][]string),
+		multilineApps: multilineApps,
 	}
 }
 
@@ -173,23 +177,21 @@ func (a *LogstashAdapter) readMessages(
 		return a.expireCache(t), Continue
 	case msg, ok := <-logstream:
 		if ok {
-		    multilineAppsStr := os.Getenv("APPS_WITH_MULTILINE_LOGS")
-		    multilineApps := strings.Split(multilineAppsStr,",")
 
 		    containerType := getEnvVar(msg.Container.Config.Env, "TYPE")
 		    if containerType == "" {
 			containerType = "<unknown>"
 		    }
 
-		    if stringIn(containerType, multilineApps) {
-			log.Println("Logstash-adapter: APP of type " + string(containerType) + " has multiline logs, buffering message ...")
+		    if stringIn(containerType, a.multilineApps) {
+			// log.Println("Logstash-adapter: APP of type " + string(containerType) + " has multiline logs, buffering message ...")
 				    return a.bufferMessage(msg), Continue
 		    } else {
-			log.Println("Logstash-adapter: APP of type " + string(containerType) + " has not multiline logs, not buffering message ...")
+			// log.Println("Logstash-adapter: APP of type " + string(containerType) + " has not multiline logs, not buffering message ...")
 			return []*router.Message{msg}, Continue
 		    }
 		} else {
-			return a.flushPendingMessages(), Quit
+		    return a.flushPendingMessages(), Quit
 		}
 	}
 }
@@ -332,7 +334,7 @@ type DockerInfo struct {
 }
 
 type KubernetesInfo struct {
-	Pod		   string `json:"pod"`
+	Pod		 string `json:"pod"`
 	Container	 string `json:"container"`
 	Namespace	 string `json:"namespace"`
 }
