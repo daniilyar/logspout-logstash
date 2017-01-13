@@ -256,49 +256,44 @@ func (a *LogstashAdapter) sendMessages(msgs []*router.Message) {
 	logMeter.Mark(int64(len(msgs)))
 }
 
-//error when sending message to logstash:write udp 172.16.38.25:43052->10.254.62.112:5553: write: connection refused
-
 func (a *LogstashAdapter) sendMessage(msg *router.Message) error {
-    
+
 	buff, err := serialize(msg, a)
-
 	if err != nil {
-		return err
+	    return err
 	}
 
+	// Try sending message once
 	_, err = a.write(buff)
-    
-	if err != nil {
-		log.Println("Logstash-adapter: cannot send messages to logstash, retrying with backoff up to 12 times ...")
-		err := retryExp(func() error {
-			_, err := a.write(buff)
-			if err == nil {
-				log.Println("Logstash-adapter: retry successful")
-				return nil
-			}
 
-			return err
-		}, 12)
-		return err
+	if err == nil {
+	    return nil
+	} else {
+	    // If there is an error, then retry with backoffs
+	    return retryExp(a, buff,12)
 	}
-
-	return nil
 }
 
-func retryExp(fun func() error, tries uint) error {
-	try := uint(0)
+func retryExp(a *LogstashAdapter, buff []byte, tries uint) error {
+
+	log.Println("Logstash-adapter: cannot send message to logstash, retrying with backoff up to " + strconv.FormatUint(uint64(tries), 10) + " times ...")
+
+	try := uint(1)
 	for {
-		err := fun()
+		_, err := a.write(buff)
 		if err == nil {
-			return nil
+		    log.Println("Logstash-adapter: message send: retry successful after " + strconv.FormatUint(uint64(try), 10) + " tries")
+		    return nil
 		}
 
-		try++
+		log.Println("Logstash-adapter: Retrying message send - " + strconv.FormatUint(uint64(try), 10))
+
 		if try > tries {
-			return err
+		    return err
 		}
 
 		time.Sleep((1 << try) * 60 * time.Millisecond)
+		try++
 	}
 }
 
