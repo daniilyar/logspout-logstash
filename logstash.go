@@ -250,8 +250,8 @@ func (a *LogstashAdapter) sendMessages(msgs []*router.Message) {
 	for _, msg := range msgs {
 		if err := a.sendMessage(msg); err != nil {
 			log.Fatal("error when sending message to logstash:", err)
-            // DY: TODO: implement retries with backoff
-            os.Exit(3)
+                        // DY: TODO: implement retries with backoff
+                        os.Exit(3)
 		}
 	}
 	logMeter.Mark(int64(len(msgs)))
@@ -279,31 +279,20 @@ func serialize(msg *router.Message, a *LogstashAdapter) ([]byte, error) {
 	var js []byte
 	var jsonMsg map[string]interface{}
 
-	dockerInfo := DockerInfo{
-		//Name:	     msg.Container.Name,
-		ID:		     msg.Container.ID[0:6], // take only first 6 symbols of container ID
-		// Image:	 msg.Container.Config.Image,
-		// Hostname: msg.Container.Config.Hostname,
-	}
-
-	kubernetesInfo := KubernetesInfo{
-		Pod:		 msg.Container.Config.Labels["io.kubernetes.pod.name"],
-		Container:	 msg.Container.Config.Labels["io.kubernetes.container.name"],
-		Namespace:	 msg.Container.Config.Labels["io.kubernetes.pod.namespace"],
-	}
-
 	tags := GetContainerTags(msg.Container, a)
 
 	err := json.Unmarshal([]byte(msg.Data), &jsonMsg)
 
 	if err != nil {
 		// the message is not in JSON make a new JSON message
-		msg := LogstashMessage{
+		msg := LogstashMessage {
 			Message: msg.Data,
 			Logtype: getEnvVar(msg.Container.Config.Env, "TYPE"),
 			// App: getEnvVar(msg.Container.Config.Env, "APP"),
-			Docker:  dockerInfo,
-			Kubernetes: kubernetesInfo,
+			DockerContainerID: msg.Container.ID[0:6], // take only first 6 symbols of container ID
+			KubernetesPod: msg.Container.Config.Labels["io.kubernetes.pod.name"],
+			KubernetesContainer: msg.Container.Config.Labels["io.kubernetes.container.name"],
+			KubernetesNamespace: msg.Container.Config.Labels["io.kubernetes.pod.namespace"],
 			Stream:  msg.Source,
 			Tags:	tags,
 		}
@@ -313,9 +302,8 @@ func serialize(msg *router.Message, a *LogstashAdapter) ([]byte, error) {
 		}
 	} else {
 		// the message is already in JSON just add the docker specific fields as a nested structure
-		jsonMsg["docker"] = dockerInfo
-		jsonMsg["tags"] = tags
-		jsonMsg["stream"] = msg.Source
+		// jsonMsg["tags"] = tags
+		// jsonMsg["stream"] = msg.Source
 
 		js, err = json.Marshal(jsonMsg)
 		if err != nil {
@@ -326,28 +314,16 @@ func serialize(msg *router.Message, a *LogstashAdapter) ([]byte, error) {
 	return js, nil
 }
 
-type DockerInfo struct {
-	//Name	 string `json:"name"`
-	ID	   string `json:"id"`
-	//Image	string `json:"image"`
-	//Hostname string `json:"hostname"`
-}
-
-type KubernetesInfo struct {
-	Pod		 string `json:"pod"`
-	Container	 string `json:"container"`
-	Namespace	 string `json:"namespace"`
-}
-
 // LogstashMessage is a simple JSON input to Logstash.
 type LogstashMessage struct {
-	Message	string		 `json:"message"`
-	Stream	 string		 `json:"stream"`
-	Logtype	string		 `json:"log_type"`
-	// App	 string		 `json:"app"`
-	Docker	 DockerInfo	 `json:"docker"`
-	Kubernetes KubernetesInfo `json:"k8"`
-	Tags	   []string	   `json:"tags"`
+	Message	string		   `json:"message"`
+	Stream	 string		   `json:"stream"`
+	Logtype	string		   `json:"log_type"`
+	DockerContainerID string   `json:"container_id"`
+	KubernetesPod   string     `json:"k8_pod"`
+	KubernetesContainer string `json:"k8_container"`
+	KubernetesNamespace string `json:"k8_namespace"`
+	Tags	   []string        `json:"tags"`
 }
 
 // writers
