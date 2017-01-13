@@ -128,14 +128,7 @@ func NewLogstashAdapter(route *router.Route) (router.LogAdapter, error) {
 	    return nil, errors.New("unable to find adapter: " + route.Adapter)
 	}
 
-	var write writer
-	if transportId == "tcp" {
-		log.Fatal("Logstash-adapter: TCP is not supported")
-		os.Exit(4)
-		//write = tcpWriter(transport)
-	} else {
-	    write = defaultWriter(route, transport)
-	}
+	var write = createWriter(route, transport)
 
 	return newLogstashAdapter(route, write), nil
 }
@@ -247,9 +240,9 @@ func (a *LogstashAdapter) sendMessages(msgs []*router.Message) {
 	for _, msg := range msgs {
 		err := a.sendMessage(msg)
 		if err == nil {
-		    log.Println("Logstash-adapter: " + strconv.Itoa(len(msgs)) + " message(s) sent to logstash ...")
+		    log.Println("Logstash-adapter: " + strconv.Itoa(len(msgs)) + " message(s) sent")
 		} else {
-		    log.Fatal("Logstash-adapter: error sending "+strconv.Itoa(len(msgs))+" messages to logstash:", err)
+		    log.Fatal("Logstash-adapter: error sending "+strconv.Itoa(len(msgs))+" msg(s) to logstash:", err)
 		    os.Exit(3)
 		}
 	}
@@ -321,13 +314,11 @@ type LogstashMessage struct {
 // writers
 type writer func(b []byte) error
 
-func defaultWriter(route *router.Route, transport router.AdapterTransport) writer {
+func createWriter(route *router.Route, transport router.AdapterTransport) writer {
 
 	log.Println("Logstash-adapter: creating default writer ...")
 
 	return func(buff []byte) error {
-
-		log.Println("Logstash-adapter: about to connect to Logstash ...")
 
 		conn, connErr := getConnection(transport, route, 12)
 
@@ -351,13 +342,13 @@ func defaultWriter(route *router.Route, transport router.AdapterTransport) write
 
 func getConnection(transport router.AdapterTransport, route *router.Route, tries uint) (net.Conn, error) {
 
-	log.Println("Logstash-adapter: getting Logstash connection ...")
-
 	try := uint(1)
 	for {
 		conn, err := transport.Dial(route.Address, route.Options)
 		if err == nil && conn != nil {
-		    log.Println("Logstash-adapter: connect: successful after " + strconv.FormatUint(uint64(try), 10) + " trie(s)")
+		    if try > 1 {
+			log.Println("Logstash-adapter: connect: successful after " + strconv.FormatUint(uint64(try), 10) + " trie(s)")
+		    }
 		    return conn, nil
 		} else {
 		    log.Println("Logstash-adapter: error connecting to Logstash, reconnecting (" + strconv.FormatUint(uint64(try), 10) + ")", err)
@@ -375,14 +366,14 @@ func getConnection(transport router.AdapterTransport, route *router.Route, tries
 
 func sendBytes (conn net.Conn, buff []byte, tries uint) (int, error) {
 
-	log.Println("Logstash-adapter: sending message bytes ...")
-
 	try := uint(1)
 	for {
 		var n int
-		n, err := conn.Write(buff)
+		n, err := conn.Write([]byte(string(buff) + "\n"))
 		if err == nil {
-		    log.Println("Logstash-adapter: message send: retry successful after " + strconv.FormatUint(uint64(try), 10) + " trie(s)")
+		    if try > 1 {
+			log.Println("Logstash-adapter: message send: retry successful after " + strconv.FormatUint(uint64(try), 10) + " trie(s)")
+		    }
 		    return n, nil
 		} else {
 		    log.Println("Logstash-adapter: Error sending data to Logstash, retrying message send (" + strconv.FormatUint(uint64(try), 10)+")", err)
@@ -396,18 +387,6 @@ func sendBytes (conn net.Conn, buff []byte, tries uint) (int, error) {
 		try++
 	}
 }
-
-
-
-//func tcpWriter(route *router.Route, transport *router.AdapterTransport) writer {
-//	return func(b []byte) (int, error) {
-//
-//        log.Println("Sending data via TCP ...")
-//
-//        // append a newline
-//		return conn.Write([]byte(string(b) + "\n"))
-//	}
-//}
 
 func getEnvVar(env []string, key string) string {
   key_equals := key + "="
