@@ -17,6 +17,7 @@ import (
 	"github.com/rcrowley/go-metrics"
 	"github.com/rcrowley/go-metrics/exp"
 	"github.com/daniilyar/logspout-logstash/multiline"
+        "gopkg.in/fatih/pool.v2"
 )
 
 var (
@@ -33,8 +34,9 @@ type newMultilineBufferFn func() (multiline.MultiLine, error)
 
 // LogstashAdapter is an adapter that streams TCP JSON to Logstash.
 type LogstashAdapter struct {
-	write	   writer
+	connectionPool pool.Pool
 	route	   *router.Route
+	transport  router.AdapterTransport
 	cache	   map[string]*multiline.MultiLine
 	cacheTTL	time.Duration
 	cachedLines metrics.Gauge
@@ -50,52 +52,45 @@ const (
 	Quit
 )
 
-func newLogstashAdapter(route *router.Route, write writer) *LogstashAdapter {
-    
-    log.Println("Creating Logstash adapter ...")
+// NewLogstashAdapter creates a LogstashAdapter with UDP as the default transport.
+func NewLogstashAdapter(route *router.Route) (router.LogAdapter, error) {
 
-	patternString, ok := route.Options["pattern"]
-	if !ok {
-		patternString = `^\[`
+	log.Println("Creating Logstash adapter ...")
+
+	transport, found := router.AdapterTransports.Lookup(route.AdapterTransport("tcp"))
+	if !found {
+	    return nil, errors.New("unable to find adapter: " + route.Adapter)
 	}
 
-	groupWith, ok := route.Options["group_with"]
-	if !ok {
-		groupWith = "previous"
-	}
-
-	negate := true
-	negateStr, _ := route.Options["negate"]
-	if negateStr == "false" {
-		negate = false
-	}
-
-	separator, ok := route.Options["separator"]
-	if !ok {
-		separator = "\n"
-	}
+	patternString := getopt(route.Options, "pattern", "PATTERN", `^\[`)
+	groupWith := getopt(route.Options, "group_with", "GROUP_WITH", "previous")
+	negateStr := getopt(route.Options, "negate", "NEGATE", "true")
+	separator := getopt(route.Options, "separator", "SEPARATOR", "\n")
 
 	maxLines, err := strconv.Atoi(route.Options["max_lines"])
 	if err != nil {
-		maxLines = 0
+	    maxLines = 0
 	}
 
 	cacheTTL, err := time.ParseDuration(route.Options["cache_ttl"])
 	if err != nil {
-		cacheTTL = 10 * time.Second
+	    cacheTTL = 10 * time.Second
 	}
 
 	cachedLines := metrics.NewGauge()
 	metrics.Register(route.ID+"_cached_lines", cachedLines)
 
-        log.Println("Created Logstash adapter with following settings:")
+	log.Println("Created Logstash adapter with following settings:")
 	log.Println("Logstash-adapter: multiline options: [ pattern=" + string(patternString) + ", groupWith=" + string(groupWith) + ", negate=" + negateStr + ", separator=" + string(separator), ", maxLines=" + string(maxLines) + ", cacheTTL=" + string(cacheTTL) + " ]")
 
 	multilineApps := strings.Split(os.Getenv("APPS_WITH_MULTILINE_LOGS"),",")
 
+	connectionPool := createConnectionPool(transport, route)
+
 	return &LogstashAdapter{
+		connectionPool: connectionPool,
 		route:	     route,
-		write:	     write,
+		transport:   transport,
 		cache:	     make(map[string]*multiline.MultiLine),
 		cacheTTL:	 cacheTTL,
 		cachedLines: cachedLines,
@@ -104,33 +99,53 @@ func newLogstashAdapter(route *router.Route, write writer) *LogstashAdapter {
 				&multiline.MultilineConfig{
 					Pattern:   regexp.MustCompile(patternString),
 					GroupWith: groupWith,
-					Negate:	negate,
+					Negate:	   negateStr == "true",
 					Separator: &separator,
 					MaxLines:  maxLines,
 				})
 		},
-                containerTags: make(map[string][]string),
+		containerTags: make(map[string][]string),
 		multilineApps: multilineApps,
-	}
+	}, nil
 }
 
-// NewLogstashAdapter creates a LogstashAdapter with UDP as the default transport.
-func NewLogstashAdapter(route *router.Route) (router.LogAdapter, error) {
-	transportId, ok := route.Options["transport"]
-	if !ok {
-	    transportId = "udp"
+func createConnectionPool (transport router.AdapterTransport, route *router.Route) pool.Pool {
+	connectionPoolFactory := func()(net.Conn, error){ return getConnection(transport, route) }
+
+	// create a new channel based pool with an initial capacity of 1 and maximum capacity of 10. The factory will create 1 initial connections and put them into the pool.
+	connectionPool, err := pool.NewChannelPool(1, 5, connectionPoolFactory)
+	if err != nil {
+	    log.Fatal("Logstash-adapter: Can't create connection pool", err)
+	    os.Exit(8)
 	}
 
-        log.Println("Logstash-adapter: using " + string(transportId) + " transport ...")
+	return connectionPool
+}
 
-	transport, found := router.AdapterTransports.Lookup(route.AdapterTransport(transportId))
-	if !found {
-	    return nil, errors.New("unable to find adapter: " + route.Adapter)
+func getConnection(transport router.AdapterTransport, route *router.Route) (net.Conn, error) {
+
+	tries := uint(13)
+
+	try := uint(1)
+	for {
+		conn, err := transport.Dial(route.Address, route.Options)
+		if err == nil && conn != nil {
+			if try > 1 {
+			    log.Println("Logstash-adapter: connect: successful after " + strconv.FormatUint(uint64(try), 10) + " trie(s)")
+			}
+			return conn, nil
+		} else {
+		    log.Println("Logstash-adapter: error connecting to Logstash, reconnecting (" + strconv.FormatUint(uint64(try), 10) + ")", err)
+		}
+
+		if try > tries {
+		    log.Fatal("Can't connect to Logstash after 12 tries")
+		    os.Exit(3)
+		}
+
+		time.Sleep((1 << try) * 30 * time.Millisecond)
+		try++
 	}
-
-	var write = createWriter(route, transport)
-
-	return newLogstashAdapter(route, write), nil
 }
 
 func (a *LogstashAdapter) lookupBuffer(msg *router.Message) *multiline.MultiLine {
@@ -239,14 +254,17 @@ func (a *LogstashAdapter) flushPendingMessages() []*router.Message {
 func (a *LogstashAdapter) sendMessages(msgs []*router.Message) {
 	for _, msg := range msgs {
 		err := a.sendMessage(msg)
-		if err == nil {
-		    log.Println("Logstash-adapter: " + strconv.Itoa(len(msgs)) + " message(s) sent")
-		} else {
-		    log.Fatal("Logstash-adapter: error sending "+strconv.Itoa(len(msgs))+" msg(s) to logstash:", err)
+		if err != nil {
+		    log.Fatal("Logstash-adapter: error sending message to logstash - ", err)
 		    os.Exit(3)
 		}
 	}
-	logMeter.Mark(int64(len(msgs)))
+
+	msgCount := len(msgs)
+	if msgCount > 0 {
+	    log.Println("Logstash-adapter: " + strconv.Itoa(msgCount) + " message(s) sent")
+	    logMeter.Mark(int64(msgCount))
+	}
 }
 
 func (a *LogstashAdapter) sendMessage(msg *router.Message) error {
@@ -256,7 +274,13 @@ func (a *LogstashAdapter) sendMessage(msg *router.Message) error {
 	    return err
 	}
 
-	return a.write(buff)
+	_, err = write(a, buff, 13)
+	if err != nil {
+	    log.Fatal("Logstash-adapter: cannot write message to logstash after 15 tries - ", err)
+	    os.Exit(6)
+	}
+
+	return nil
 }
 
 func serialize(msg *router.Message, a *LogstashAdapter) ([]byte, error) {
@@ -311,81 +335,56 @@ type LogstashMessage struct {
 	Tags	   []string        `json:"tags"`
 }
 
-// writers
-type writer func(b []byte) error
+func write (a *LogstashAdapter, buff []byte, tries uint) (int, error) {
 
-func createWriter(route *router.Route, transport router.AdapterTransport) writer {
-
-	log.Println("Logstash-adapter: creating default writer ...")
-
-	return func(buff []byte) error {
-
-		conn, connErr := getConnection(transport, route, 12)
-
-		if connErr != nil {
-      		    log.Fatal("Can't connect to Logstash after 12 tries")
-		    os.Exit(3)
-		}
-
-		_, err := sendBytes(conn, buff, 12)
-		if err != nil {
-		    log.Println("Logstash-adapter: cannot send message to logstash after 12 tries", err)
-		    os.Exit(6)
-		}
-		if conn != nil {
-		    conn.Close()
-		}
-
-		return err
-	}
-}
-
-func getConnection(transport router.AdapterTransport, route *router.Route, tries uint) (net.Conn, error) {
-
-	try := uint(1)
-	for {
-		conn, err := transport.Dial(route.Address, route.Options)
-		if err == nil && conn != nil {
-		    if try > 1 {
-			log.Println("Logstash-adapter: connect: successful after " + strconv.FormatUint(uint64(try), 10) + " trie(s)")
-		    }
-		    return conn, nil
-		} else {
-		    log.Println("Logstash-adapter: error connecting to Logstash, reconnecting (" + strconv.FormatUint(uint64(try), 10) + ")", err)
-		}
-
-		if try > tries {
-		    return nil, err
-		}
-
-		time.Sleep((1 << try) * 60 * time.Millisecond)
-		try++
-	}
-}
-
-
-func sendBytes (conn net.Conn, buff []byte, tries uint) (int, error) {
+	conn := getConnectionFromPool(a)
 
 	try := uint(1)
 	for {
 		var n int
 		n, err := conn.Write([]byte(string(buff) + "\n"))
 		if err == nil {
-		    if try > 1 {
-			log.Println("Logstash-adapter: message send: retry successful after " + strconv.FormatUint(uint64(try), 10) + " trie(s)")
-		    }
-		    return n, nil
+			if try > 1 {
+				log.Println("Logstash-adapter: message send: retry successful after " + strconv.FormatUint(uint64(try), 10) + " trie(s)")
+			}
+			return n, nil
 		} else {
-		    log.Println("Logstash-adapter: Error sending data to Logstash, retrying message send (" + strconv.FormatUint(uint64(try), 10)+")", err)
+			if strings.Contains(err.Error(), "broken pipe") {
+				log.Println("Logstash-adapter: broken pipe error occured. Re-initializing Logstash connection ...")
+
+				// close and re-create Logstash connection pool
+				a.connectionPool.Close()
+				a.connectionPool = createConnectionPool(a.transport, a.route)
+
+				// re-create the current connection
+				conn = getConnectionFromPool(a)
+			} else {
+				log.Println("Logstash-adapter: Error sending data to Logstash, retrying message send ("+strconv.FormatUint(uint64(try), 10)+")", err)
+			}
 		}
 
 		if try > tries {
-		    return n, err
+			return n, err
 		}
 
-		time.Sleep((1 << try) * 60 * time.Millisecond)
+		time.Sleep((1 << try) * 30 * time.Millisecond)
 		try++
 	}
+
+	if conn != nil {
+	    conn.Close()
+	}
+
+	return 0, nil
+}
+
+func getConnectionFromPool(a *LogstashAdapter) net.Conn {
+	conn, err := a.connectionPool.Get()
+	if err != nil {
+	    log.Fatal("Cannot get connection from pool - ", err)
+	    os.Exit(10)
+	}
+	return conn
 }
 
 func getEnvVar(env []string, key string) string {
@@ -396,6 +395,17 @@ func getEnvVar(env []string, key string) string {
 	}
   }
   return ""
+}
+
+func getopt(options map[string]string, optkey string, envkey string, default_value string) (value string) {
+	value = options[optkey]
+	if value == "" {
+		value = os.Getenv(envkey)
+		if value == "" {
+			value = default_value
+		}
+	}
+	return
 }
 
 // Get container tags configured with the environment variable LOGSTASH_TAGS
